@@ -34,11 +34,20 @@ self.addEventListener('fetch', e => {
   const isMedia = url.pathname.includes('/img/') || url.pathname.includes('/gif/')
   if (isMedia) {
     e.respondWith(caches.open(CACHE).then(c => c.match(e.request).then(hit =>
-      hit || fetch(e.request).then(res => { if (res.ok) c.put(e.request, res.clone()); return res })
+      hit || fetch(e.request).then(res => {
+        if (res.ok) {
+          const copy = res.clone()
+          c.put(e.request, copy)
+        }
+        return res
+      })
     )))
   } else {
     e.respondWith(fetch(e.request).then(res => {
-      if (res.ok) caches.open(CACHE).then(c => c.put(e.request, res.clone()))
+      if (res.ok) {
+        const copy = res.clone()
+        caches.open(CACHE).then(c => c.put(e.request, copy))
+      }
       return res
     }).catch(() => caches.match(e.request).then(hit => hit || caches.match('index.html'))))
   }
