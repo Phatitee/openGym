@@ -12,9 +12,29 @@ import webpush from 'web-push';
 
 const PORT = +(process.env.PORT || 3000);
 const DATA = process.env.DATA_DIR || '/data';
-const RP_ID = process.env.RP_ID || 'localhost';
-const ORIGIN = process.env.ORIGIN || 'http://localhost:8080';
+const RP_ID = process.env.RP_ID;
+const ORIGIN = process.env.ORIGIN;
 const RP_NAME = process.env.RP_NAME || 'openGym';
+
+function getRpId(req) {
+  if (RP_ID) return RP_ID;
+  const origin = req?.headers?.origin || req?.headers?.referer;
+  if (origin) {
+    try { return new URL(origin).hostname; } catch {}
+  }
+  return 'localhost';
+}
+
+function getOrigin(req) {
+  if (ORIGIN) return ORIGIN;
+  const origin = req?.headers?.origin;
+  if (origin) return origin;
+  const referer = req?.headers?.referer;
+  if (referer) {
+    try { return new URL(referer).origin; } catch {}
+  }
+  return 'http://localhost:8080';
+}
 // Admin dashboard (issue): admins are matched by uid; INVITE_ONLY gates new signups behind a
 // code the admin generates. Both default off so a fresh self-hosted instance stays open.
 const ADMIN_UIDS = (process.env.ADMIN_UIDS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -275,8 +295,9 @@ const routes = {
     if (INVITE_ONLY && !db.invites.some(i => i.code === code && !i.usedBy && !i.revoked))
       return json(res, 403, { error: 'a valid invite code is required' });
     const uid = crypto.randomBytes(12).toString('base64url');
+    const rpID = getRpId(req);
     const options = await generateRegistrationOptions({
-      rpName: RP_NAME, rpID: RP_ID,
+      rpName: RP_NAME, rpID,
       userID: Buffer.from(uid), userName: name, userDisplayName: name,
       attestationType: 'none',
       authenticatorSelection: { residentKey: 'required', userVerification: 'preferred' },
@@ -295,8 +316,8 @@ const routes = {
       verification = await verifyRegistrationResponse({
         response: body.credential,
         expectedChallenge: c.challenge,
-        expectedOrigin: ORIGIN,
-        expectedRPID: RP_ID,
+        expectedOrigin: getOrigin(req),
+        expectedRPID: getRpId(req),
         requireUserVerification: false
       });
     } catch (e) { return json(res, 400, { error: 'verification failed: ' + e.message }); }
@@ -324,7 +345,7 @@ const routes = {
 
   'POST /api/login/options': async (req, res) => {
     const options = await generateAuthenticationOptions({
-      rpID: RP_ID, userVerification: 'preferred', allowCredentials: []
+      rpID: getRpId(req), userVerification: 'preferred', allowCredentials: []
     });
     const cid = putChallenge({ challenge: options.challenge });
     json(res, 200, { cid, options });
@@ -341,8 +362,8 @@ const routes = {
       verification = await verifyAuthenticationResponse({
         response: body.credential,
         expectedChallenge: c.challenge,
-        expectedOrigin: ORIGIN,
-        expectedRPID: RP_ID,
+        expectedOrigin: getOrigin(req),
+        expectedRPID: getRpId(req),
         requireUserVerification: false,
         credential: {
           id: cred.id,
