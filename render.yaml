@@ -1,6 +1,7 @@
 services:
   - type: web
-    name: opengym
+    name: opengym-api
     env: docker
-    dockerfilePath: ./Dockerfile
-    dockerContext: .
+    plan: free
+    dockerfilePath: ./api/Dockerfile
+    dockerContext: ./api
