@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@simplewebauthn/server": "^13.1.1",
+    "firebase": "^12.17.1",
     "web-push": "^3.6.7"
   }
 }

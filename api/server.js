@@ -1,5 +1,5 @@
 /* opengym-api — passkey (WebAuthn) auth + per-user state storage for openGym
-   No framework, JSON-file storage, signed session cookies.               */
+   No framework, JSON-file storage, signed session cookies + Firestore cloud backup. */
 import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -9,9 +9,23 @@ import {
   generateAuthenticationOptions, verifyAuthenticationResponse
 } from '@simplewebauthn/server';
 import webpush from 'web-push';
+import { initializeApp } from 'firebase/app';
+import { getFirestore, doc, getDoc, setDoc } from 'firebase/firestore';
+
+const firebaseConfig = {
+  apiKey: process.env.FIREBASE_API_KEY || 'AIzaSyAhkpOJXa4M5Q7af2HmbZwylIPs87cn8Fc',
+  authDomain: process.env.FIREBASE_AUTH_DOMAIN || 'opengym-b803c.firebaseapp.com',
+  projectId: process.env.FIREBASE_PROJECT_ID || 'opengym-b803c',
+  storageBucket: process.env.FIREBASE_STORAGE_BUCKET || 'opengym-b803c.firebasestorage.app',
+  messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID || '727557352655',
+  appId: process.env.FIREBASE_APP_ID || '1:727557352655:web:19c976517c0a1a124b1bba'
+};
+
+const firebaseApp = initializeApp(firebaseConfig);
+const firestore = getFirestore(firebaseApp);
 
 const PORT = +(process.env.PORT || 3000);
-const DATA = process.env.DATA_DIR || '/data';
+const DATA = process.env.DATA_DIR || '/tmp/data';
 const RP_ID = process.env.RP_ID;
 const ORIGIN = process.env.ORIGIN;
 const RP_NAME = process.env.RP_NAME || 'openGym';
@@ -35,41 +49,102 @@ function getOrigin(req) {
   }
   return 'http://localhost:8080';
 }
-// Admin dashboard (issue): admins are matched by uid; INVITE_ONLY gates new signups behind a
-// code the admin generates. Both default off so a fresh self-hosted instance stays open.
+
 const ADMIN_UIDS = (process.env.ADMIN_UIDS || '').split(',').map(s => s.trim()).filter(Boolean);
 const INVITE_ONLY = /^(1|true|yes|on)$/i.test(process.env.INVITE_ONLY || '');
-// 90 days keeps someone who trains a few times a week permanently signed in without a stolen
-// cookie staying good for a year. Overridable because a family instance and one on the open
-// internet don't want the same number. Only affects cookies minted from now on — the expiry is
-// baked into each cookie when it's issued, so lowering this never cuts an existing session short.
 const SESSION_DAYS = Math.max(1, +(process.env.SESSION_DAYS || 90) || 90);
 const MAX_BODY = 5 * 1024 * 1024;
-// Secure cookies require HTTPS; over plain http://localhost the flag would drop the cookie
 const SECURE = /^https:/i.test(ORIGIN) ? ' Secure;' : '';
 
-fs.mkdirSync(DATA, { recursive: true });
+try { fs.mkdirSync(DATA, { recursive: true }); } catch {}
 
-/* ---------- secret + db ---------- */
+/* ---------- secret + db + firestore ---------- */
 const secretFile = path.join(DATA, 'secret');
-if (!fs.existsSync(secretFile)) fs.writeFileSync(secretFile, crypto.randomBytes(32).toString('hex'), { mode: 0o600 });
-const SECRET = fs.readFileSync(secretFile, 'utf8').trim();
+if (!fs.existsSync(secretFile)) {
+  try { fs.writeFileSync(secretFile, process.env.SECRET || crypto.randomBytes(32).toString('hex'), { mode: 0o600 }); } catch {}
+}
+const SECRET = (fs.existsSync(secretFile) ? fs.readFileSync(secretFile, 'utf8').trim() : '') || process.env.SECRET || 'opengym_secret_key_default_32bytes';
 
 const dbFile = path.join(DATA, 'db.json');
 let db = { users: [], creds: [], subs: [], invites: [] };
 try { db = JSON.parse(fs.readFileSync(dbFile, 'utf8')); } catch {}
+db.users = db.users || [];
+db.creds = db.creds || [];
 db.subs = db.subs || [];
 db.invites = db.invites || [];
+
 const isAdmin = user => !!user && (user.admin === true || ADMIN_UIDS.includes(user.id));
-function saveDb() { atomicWrite(dbFile, JSON.stringify(db, null, 2)); }
-function atomicWrite(file, content) {
-  const tmp = file + '.tmp';
-  fs.writeFileSync(tmp, content);
-  fs.renameSync(tmp, file);
+
+function saveDb() {
+  try { atomicWrite(dbFile, JSON.stringify(db, null, 2)); } catch {}
+  setDoc(doc(firestore, 'system', 'main_db'), JSON.parse(JSON.stringify(db))).catch(e => {
+    console.error('Firestore saveDb error:', e);
+  });
 }
+
+function atomicWrite(file, content) {
+  try {
+    const tmp = file + '.tmp';
+    fs.writeFileSync(tmp, content);
+    fs.renameSync(tmp, file);
+  } catch {}
+}
+
 const stateFile = uid => path.join(DATA, 'state-' + uid.replace(/[^a-zA-Z0-9_-]/g, '') + '.json');
+const stateCache = new Map();
+
 function readState(uid) {
-  try { return JSON.parse(fs.readFileSync(stateFile(uid), 'utf8')); } catch { return null; }
+  if (stateCache.has(uid)) return stateCache.get(uid);
+  try {
+    const data = JSON.parse(fs.readFileSync(stateFile(uid), 'utf8'));
+    stateCache.set(uid, data);
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+async function readStateAsync(uid) {
+  if (stateCache.has(uid)) return stateCache.get(uid);
+  try {
+    const snap = await getDoc(doc(firestore, 'user_states', uid));
+    if (snap.exists()) {
+      const data = snap.data();
+      stateCache.set(uid, data);
+      try { atomicWrite(stateFile(uid), JSON.stringify(data)); } catch {}
+      return data;
+    }
+  } catch (e) {
+    console.error('Firestore readState error:', e);
+  }
+  return readState(uid);
+}
+
+function saveState(uid, data) {
+  stateCache.set(uid, data);
+  try { atomicWrite(stateFile(uid), JSON.stringify(data)); } catch {}
+  setDoc(doc(firestore, 'user_states', uid), JSON.parse(JSON.stringify(data))).catch(e => {
+    console.error('Firestore saveState error:', e);
+  });
+}
+
+async function loadDbFromFirestore() {
+  try {
+    const snap = await getDoc(doc(firestore, 'system', 'main_db'));
+    if (snap.exists()) {
+      const data = snap.data();
+      db.users = data.users || [];
+      db.creds = data.creds || [];
+      db.subs = data.subs || [];
+      db.invites = data.invites || [];
+      console.log(`Loaded DB from Firestore: ${db.users.length} users, ${db.creds.length} creds`);
+    }
+    for (const u of db.users) {
+      await readStateAsync(u.id);
+    }
+  } catch (e) {
+    console.error('Firestore loadDb error:', e);
+  }
 }
 
 /* ---------- push notifications (Web Push / VAPID) ---------- */
@@ -565,27 +640,29 @@ const routes = {
   }
 };
 
-http.createServer(async (req, res) => {
-  const origin = req.headers.origin;
-  if (origin) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Cookie');
-  }
+loadDbFromFirestore().then(() => {
+  http.createServer(async (req, res) => {
+    const origin = req.headers.origin;
+    if (origin) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Cookie');
+    }
 
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204);
-    return res.end();
-  }
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      return res.end();
+    }
 
-  const url = new URL(req.url, 'http://x');
-  const key = req.method + ' ' + url.pathname;
-  const handler = routes[key];
-  if (!handler) return json(res, 404, { error: 'not found' });
-  try { await handler(req, res); }
-  catch (e) {
-    console.error(key, e);
-    if (!res.headersSent) json(res, 500, { error: 'server error' });
-  }
-}).listen(PORT, () => console.log(`gym-api on :${PORT} (rpID=${RP_ID}, origin=${ORIGIN})`));
+    const url = new URL(req.url, 'http://x');
+    const key = req.method + ' ' + url.pathname;
+    const handler = routes[key];
+    if (!handler) return json(res, 404, { error: 'not found' });
+    try { await handler(req, res); }
+    catch (e) {
+      console.error(key, e);
+      if (!res.headersSent) json(res, 500, { error: 'server error' });
+    }
+  }).listen(PORT, () => console.log(`gym-api on :${PORT} with Firestore cloud persistence`));
+});
